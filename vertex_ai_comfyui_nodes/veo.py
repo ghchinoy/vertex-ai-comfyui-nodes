@@ -51,7 +51,7 @@ class Veo3Node:
                     "multiline": False,
                     "default": os.environ.get("GOOGLE_CLOUD_REGION", "us-central1")
                 }),
-                "model": (["veo-3.0-fast-generate-preview", "veo-3.0-generate-preview"],),
+                "model": (["veo-3.0-fast-generate-preview", "veo-3.0-generate-preview", "veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"],),
                 "prompt": ("STRING", {
                     "multiline": True,
                     "default": "A cinematic shot of a panda eating bamboo."
@@ -59,16 +59,12 @@ class Veo3Node:
             },
             "optional": {
                 "first_frame": ("IMAGE",),
+                "last_frame": ("IMAGE",),
                 "output_gcs_uri": ("STRING", {
                     "multiline": False,
                     "default": ""
                 }),
-                "duration_seconds": ("INT", {
-                    "default": 8,
-                    "min": 8,
-                    "max": 8,
-                    "step": 1
-                }),
+                "duration_seconds": ((4, 6, 8),),
                 "resolution": (["1080p", "720p"],),
                 "compression_quality": (["OPTIMIZED", "LOSSLESS"],),
                 "enhance_prompt": ("BOOLEAN", {"default": True}),
@@ -96,7 +92,7 @@ class Veo3Node:
         """
         self.client = None
 
-    async def generate_video(self, project_id, location, model, prompt, first_frame=None, output_gcs_uri=None, duration_seconds=8, resolution="1080p", compression_quality="OPTIMIZED", enhance_prompt=True, generate_audio=True, person_generation="allow_adult", seed=0):
+    async def generate_video(self, project_id, location, model, prompt, first_frame=None, last_frame=None, output_gcs_uri=None, duration_seconds=8, resolution="1080p", compression_quality="OPTIMIZED", enhance_prompt=True, generate_audio=True, person_generation="allow_adult", seed=0):
         """
         Generates a video using the Veo 3 API.
 
@@ -111,6 +107,7 @@ class Veo3Node:
             model (str): The Veo 3 model to use.
             prompt (str): The text prompt for the video.
             first_frame (torch.Tensor, optional): The first frame of the video.
+            last_frame (torch.Tensor, optional): The last frame of the video.
             output_gcs_uri (str, optional): GCS URI to save the output video.
             duration_seconds (int): The duration of the video in seconds.
             resolution (str): The resolution of the video.
@@ -145,6 +142,11 @@ class Veo3Node:
         if output_gcs_uri:
             config["output_gcs_uri"] = output_gcs_uri
 
+        last_frame_path = None
+        if last_frame is not None:
+            last_frame_path = tensor_to_temp_image_file(last_frame)
+            config["last_frame"] = types.Image.from_file(location=last_frame_path)
+
         config = types.GenerateVideosConfig(**config)
 
         # Handle image-to-video generation if a first frame is provided.
@@ -178,6 +180,8 @@ class Veo3Node:
 
         if image_path:
             os.remove(image_path)
+        if last_frame_path:
+            os.remove(last_frame_path)
 
         if operation.error:
             raise ValueError(operation.error["message"])
@@ -200,6 +204,162 @@ class Veo3Node:
                 return (video_object,)
             else:
                 # Handle videos returned directly as bytes.
+                video_paths = []
+                for i, video in enumerate(operation.result.generated_videos):
+                    video_bytes = video.video.video_bytes
+                    video_preview = save_video_for_preview(video_bytes, folder_paths.get_temp_directory())
+                    video_paths.append(video_preview["full_path"])
+
+                video_file_path = video_paths[0] if video_paths else None
+
+                if not video_file_path:
+                    return (None,)
+
+                video_object = VideoFromFile(video_file_path)
+                return (video_object,)
+
+        return (None,)
+
+class Veo3IngredientsNode:
+    """
+    A ComfyUI node for generating video from a prompt and reference images
+    using the Veo 3.1 API (Ingredients to Video).
+    """
+    @classmethod
+    def INPUT_TYPES(s):
+        """
+        Defines the input types for the Veo 3 Ingredients node.
+        """
+        return {
+            "required": {
+                "project_id": ("STRING", {
+                    "multiline": False,
+                    "default": os.environ.get("GOOGLE_CLOUD_PROJECT")
+                }),
+                "location": ("STRING", {
+                    "multiline": False,
+                    "default": os.environ.get("GOOGLE_CLOUD_REGION", "us-central1")
+                }),
+                "model": (["veo-3.1-generate-preview"],),
+                "prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "A cinematic shot of a panda eating bamboo."
+                }),
+                "reference_image_1": ("IMAGE",),
+            },
+            "optional": {
+                "reference_image_2": ("IMAGE",),
+                "reference_image_3": ("IMAGE",),
+                "output_gcs_uri": ("STRING", {
+                    "multiline": False,
+                    "default": ""
+                }),
+                "duration_seconds": ("INT", {
+                    "default": 8,
+                    "min": 8,
+                    "max": 8,
+                    "step": 1
+                }),
+                "resolution": (["1080p", "720p"],),
+                "compression_quality": (["OPTIMIZED", "LOSSLESS"],),
+                "enhance_prompt": ("BOOLEAN", {"default": True}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+                "person_generation": (["allow_adult", "dont_allow", "allow_all"],),
+                "seed": ("INT", {
+                    "default": random.randint(0, 4294967295),
+                    "min": 0,
+                    "max": 4294967295
+                }),
+            }
+        }
+
+    RETURN_TYPES = (IO.VIDEO,)
+    RETURN_NAMES = ("video",)
+
+    FUNCTION = "generate_video"
+
+    CATEGORY = "Vertex AI"
+
+    def __init__(self):
+        self.client = None
+
+    async def generate_video(self, project_id, location, model, prompt, reference_image_1, reference_image_2=None, reference_image_3=None, output_gcs_uri=None, duration_seconds=8, resolution="1080p", compression_quality="OPTIMIZED", enhance_prompt=True, generate_audio=True, person_generation="allow_adult", seed=0):
+        if self.client is None:
+            self.client = genai.Client(vertexai=True, project=project_id, location=location)
+
+        config = {
+            "number_of_videos": 1,
+            "duration_seconds": duration_seconds,
+            "resolution": resolution,
+            "person_generation": person_generation,
+            "enhance_prompt": enhance_prompt,
+            "generate_audio": generate_audio,
+            "seed": seed,
+        }
+
+        if compression_quality == "LOSSLESS":
+            config["compression_quality"] = types.VideoCompressionQuality.LOSSLESS
+        else:
+            config["compression_quality"] = types.VideoCompressionQuality.OPTIMIZED
+
+        if output_gcs_uri:
+            config["output_gcs_uri"] = output_gcs_uri
+
+        reference_images = []
+        reference_image_paths = []
+
+        ref_images_input = [reference_image_1, reference_image_2, reference_image_3]
+
+        for ref_image in ref_images_input:
+            if ref_image is not None:
+                image_path = tensor_to_temp_image_file(ref_image)
+                reference_image_paths.append(image_path)
+                reference_images.append(
+                    types.VideoGenerationReferenceImage(
+                        image=types.Image.from_file(location=image_path),
+                        reference_type="asset"
+                    )
+                )
+        
+        if reference_images:
+            config["reference_images"] = reference_images
+
+        config = types.GenerateVideosConfig(**config)
+
+        operation = await asyncio.to_thread(
+            self.client.models.generate_videos,
+            model=model,
+            prompt=prompt,
+            config=config,
+        )
+
+        while not operation.done:
+            await asyncio.sleep(8)
+            operation = await asyncio.to_thread(
+                self.client.operations.get,
+                operation
+            )
+
+        for image_path in reference_image_paths:
+            os.remove(image_path)
+
+        if operation.error:
+            raise ValueError(operation.error["message"])
+
+        if operation.response:
+            if output_gcs_uri:
+                video_uri = operation.result.generated_videos[0].video.uri
+
+                storage_client = storage.Client(project=project_id)
+                bucket_name, blob_name = video_uri.replace("gs://", "").split("/", 1)
+                bucket = storage_client.bucket(bucket_name)
+                blob = bucket.blob(blob_name)
+                video_bytes = blob.download_as_bytes()
+
+                video_preview = save_video_for_preview(video_bytes, folder_paths.get_temp_directory())
+                video_object = VideoFromFile(video_preview["full_path"])
+                return (video_object,)
+            else:
                 video_paths = []
                 for i, video in enumerate(operation.result.generated_videos):
                     video_bytes = video.video.video_bytes
@@ -649,6 +809,7 @@ class VeoPromptWriterNode:
 
 NODE_CLASS_MAPPINGS = {
     "Veo3": Veo3Node,
+    "Veo3Ingredients": Veo3IngredientsNode,
     "Veo2": Veo2Node,
     "Veo2Extend": Veo2Extend,
     "Veo_Prompt_Writer": VeoPromptWriterNode,
@@ -656,6 +817,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Veo3": "Veo 3 Video Generation",
+    "Veo3Ingredients": "Veo 3 Ingredients to Video",
     "Veo2": "Veo 2 Video Generation",
     "Veo2Extend": "Veo 2 Video Extend",
     "Veo_Prompt_Writer": "Veo Prompt Writer",
